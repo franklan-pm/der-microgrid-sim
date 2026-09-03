@@ -163,6 +163,28 @@
   .ctrl label{display:flex; justify-content:space-between; font-family:'IBM Plex Mono'; font-size:14px; color:var(--muted); margin-bottom:6px;}
   .ctrl label b{color:var(--paper); font-weight:600;}
   .ctrl input[type=range]{width:100%; accent-color:var(--signal-amber);}
+  .subreadout{font-family:'IBM Plex Mono'; font-size:12px; color:var(--muted); margin-top:7px;}
+  .subreadout b{color:var(--good); font-weight:600;}
+
+  .tt{position:relative; display:inline-flex; align-items:center; margin-left:6px; cursor:help;}
+  .tt-icon{
+    width:15px; height:15px; border-radius:50%; background:#2a4d6e; color:var(--paper);
+    font-size:10.5px; font-weight:600; display:inline-flex; align-items:center; justify-content:center;
+    font-family:'IBM Plex Mono'; line-height:1; user-select:none;
+  }
+  .tt:hover .tt-icon, .tt:focus .tt-icon, .tt:focus-within .tt-icon{background:var(--signal-amber); color:#1A1102;}
+  .tt-box{
+    display:none; position:absolute; bottom:135%; left:50%; transform:translateX(-50%);
+    width:270px; background:var(--panel-navy-2); border:1px solid #2a4d6e; border-radius:8px;
+    padding:11px 13px; font-size:13px; line-height:1.5; color:var(--paper); font-family:'IBM Plex Sans';
+    text-align:left; z-index:20; box-shadow:0 6px 18px rgba(0,0,0,.45); font-weight:400;
+  }
+  .tt-box b{color:var(--signal-amber);}
+  .tt:hover .tt-box, .tt:focus .tt-box, .tt:focus-within .tt-box{display:block;}
+  .tt-box::after{
+    content:''; position:absolute; top:100%; left:50%; transform:translateX(-50%);
+    border:6px solid transparent; border-top-color:#2a4d6e;
+  }
   .toggle-row{display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:14px; font-family:'IBM Plex Mono'; font-size:14px;}
   .toggle-row button{
     background:var(--panel-navy); border:1px solid #2a4d6e; color:var(--paper);
@@ -280,8 +302,9 @@
           <input type="range" id="loadSlider" min="0" max="500" step="10" value="220">
         </div>
         <div class="ctrl">
-          <label>Battery state of charge <b id="socVal">50%</b></label>
+          <label><span>Battery state of charge<span class="tt" tabindex="0"><span class="tt-icon">i</span><span class="tt-box">State of charge is <b>stored energy</b> (how full the tank is), not power. The battery can push its full 750 kW rating from 20% SOC all the way up to 100%. Only <b>below 20% SOC</b> does the max power taper — in a straight line down to 0 kW at 0% SOC — the way real packs throttle back to protect their cells near empty. (Same taper mirrored near 100% for charging.) That ceiling only limits output when the site actually asks for more than it allows.</span></span></span> <b id="socVal">50%</b></label>
           <input type="range" id="socSlider" min="0" max="100" step="5" value="50">
+          <div class="subreadout" id="socAvail">Max available: <b>750 kW</b> discharge · <b>0 kW</b> charge</div>
         </div>
         <div class="ctrl">
           <label>Battery mode <b id="battModeLbl">Auto (balance the site)</b></label>
@@ -615,6 +638,17 @@ function computeBatteryDischarge(){
   return pgState.load - pgState.solar;
 }
 
+// Real battery packs can't deliver/accept full rated power right at the edges of their charge
+// range — power tapers off as the pack approaches empty (protecting cells from over-discharge)
+// or full (protecting cells from overcharge). Below models that with a simple linear taper over
+// the bottom/top 20% of SOC, so the SOC slider visibly affects available power near the edges.
+function batteryPowerLimits(soc){
+  const rated = 750;
+  const dischargeMax = rated * Math.max(0, Math.min(1, soc / 20));
+  const chargeMax = rated * Math.max(0, Math.min(1, (100 - soc) / 20));
+  return {dischargeMax, chargeMax};
+}
+
 function runSim(){
   document.getElementById('solarVal').textContent = pgState.solar + ' kW';
   document.getElementById('loadVal').textContent = pgState.load + ' kW';
@@ -628,10 +662,11 @@ function runSim(){
 
   let solar = pgState.solar;
   let battDischarge = computeBatteryDischarge();
-  // clamp battery to its 750kW rating and rough SOC sanity (illustrative only)
-  battDischarge = Math.max(-750, Math.min(750, battDischarge));
-  if(battDischarge > 0 && pgState.soc <= 2) battDischarge = 0; // empty
-  if(battDischarge < 0 && pgState.soc >= 98) battDischarge = 0; // full
+  // clamp battery to what's actually available at this state of charge (tapered near empty/full)
+  const {dischargeMax, chargeMax} = batteryPowerLimits(pgState.soc);
+  const socLimited = battDischarge > dischargeMax || battDischarge < -chargeMax;
+  battDischarge = Math.max(-chargeMax, Math.min(dischargeMax, battDischarge));
+  document.getElementById('socAvail').innerHTML = `Max available: <b>${Math.round(dischargeMax)} kW</b> discharge · <b>${Math.round(chargeMax)} kW</b> charge`;
 
   let gatewayTripped = false;
   let ATSisland = false;
@@ -718,8 +753,13 @@ function runSim(){
   } else {
     hint.innerHTML = `<b>Importing ${Math.round(-pccFlow)} kW from the feeder.</b> DER output (${Math.round(derOut)} kW) isn't enough to cover the ${pgState.load} kW load, so the shortfall is drawn from the grid as usual — same as any normal customer.`;
   }
+  if(socLimited){
+    const edge = dischargeMax < chargeMax ? 'nearly empty' : 'nearly full';
+    const cap = dischargeMax < chargeMax ? Math.round(dischargeMax) : Math.round(chargeMax);
+    hint.innerHTML += ` <span style="color:var(--signal-amber)">⚡ Battery is ${edge} (${pgState.soc}% SOC) — real packs taper power near the edges of their charge range, so it's capped to about ${cap} kW here instead of the full 750 kW rating.</span>`;
+  }
 
-  drawPlaygroundDiagram({solar, battDischarge, derOut, pccFlow, loadServed, gatewayTripped, ATSisland, curtailment, load:pgState.load});
+  drawPlaygroundDiagram({solar, battDischarge, derOut, pccFlow, loadServed, gatewayTripped, ATSisland, curtailment, load:pgState.load, socLimited});
 }
 
 function drawPlaygroundDiagram(s){
@@ -757,8 +797,8 @@ function drawPlaygroundDiagram(s){
   // battery branch
   const battActive = Math.abs(s.battDischarge) > 1;
   wire(svg,300,270,300,320, battActive?BATT:MUTED);
-  const battLbl = s.battDischarge>=0 ? (Math.round(s.battDischarge)+' kW out') : (Math.round(-s.battDischarge)+' kW in');
-  boxNode(svg,'b1',260,320,160,44,'Battery PCS', battActive?battLbl:'idle', battActive?BATT:'#1D3A54', null, 'battery', battActive?'#0B1E33':'#7E9BB4');
+  const battLbl = (s.battDischarge>=0 ? (Math.round(s.battDischarge)+' kW out') : (Math.round(-s.battDischarge)+' kW in')) + (s.socLimited ? ' ⚡SOC-capped' : '');
+  boxNode(svg,'b1',260,320,170,44,'Battery PCS', battActive?battLbl:'idle', battActive?BATT:'#1D3A54', null, 'battery', battActive?'#0B1E33':'#7E9BB4');
 
   // curtailment marker
   if(s.curtailment > 0){
